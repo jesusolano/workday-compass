@@ -1,0 +1,9 @@
+streamlit
+sentence-transformers
+faiss-cpu
+numpy
+transformers
+torch
+PyPDF2
+openai==0.28
+python-dotenv
