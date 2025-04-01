@@ -5,14 +5,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Generator:
-    def __init__(self, model_name="gpt-3.5-turbo", temperature=0.7):
+    def __init__(self, model_name="gpt-4-turbo", temperature=0.7):
         self.model_name = model_name
         self.temperature = temperature
         openai.api_key = os.getenv("OPENAI_API_KEY")
         if openai.api_key is None:
             raise ValueError("Please set your OPENAI_API_KEY in the .env file.")
 
-    def generate_answer(self, conversation, context, sources, max_tokens=1024):
+    def generate_answer(self, conversation, context, sources, max_tokens=2048):
         """
         Generate a freeform answer based on the conversation history, context, and sources.
         The answer should be as detailed as necessary without an arbitrary length limit.

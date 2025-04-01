@@ -7,3 +7,4 @@ torch
 PyPDF2
 openai==0.28
 python-dotenv
+pinecone

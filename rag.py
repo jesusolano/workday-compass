@@ -1,20 +1,22 @@
 import os
 import numpy as np
 from sentence_transformers import SentenceTransformer
-import faiss
 import pickle
+from pinecone import Pinecone
 
 class RAG:
-    def __init__(self, model_name='all-MiniLM-L6-v2', chunk_size=500, chunk_overlap=50, index_path="faiss.index", chunks_path="chunks.pkl"):
+    def __init__(self, pinecone_index_name, model_name='all-MiniLM-L6-v2',
+                 chunk_size=500, chunk_overlap=50, chunks_path="chunks.pkl"):
         self.model = SentenceTransformer(model_name)
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self.index_path = index_path
         self.chunks_path = chunks_path
-        self.index = None
-        self.embeddings = None
         self.chunks = []
-        self.load_index()  # Load persisted data if available
+        self.pinecone_index_name = pinecone_index_name
+        # Initialize Pinecone index using the new API.
+        # Assumes PINECONE_API_KEY is set in the environment.
+        self.index = Pinecone(api_key=os.environ["PINECONE_API_KEY"]).Index(pinecone_index_name)
+        self.load_index()  # Load persisted chunks if available
 
     def _split_text(self, text):
         text = text.replace('\n', ' ')
@@ -30,49 +32,47 @@ class RAG:
 
     def ingest_document(self, text, source="unknown"):
         new_chunks = self._split_text(text)
+        start_index = len(self.chunks)
+        # Append new chunks locally (for citation metadata)
         for chunk in new_chunks:
             self.chunks.append({"text": chunk, "source": source})
+        # Encode new chunks and ensure float32 format
         embeddings = self.model.encode(new_chunks, show_progress_bar=True)
         embeddings = np.array(embeddings).astype('float32')
-        if self.embeddings is not None:
-            self.embeddings = np.vstack([self.embeddings, embeddings])
-        else:
-            self.embeddings = embeddings
-        if self.index is None:
-            dimension = self.embeddings.shape[1]
-            self.index = faiss.IndexFlatL2(dimension)
-        self.index.add(embeddings)
+        # Prepare vectors for upsert: each is a tuple (id, vector, metadata)
+        vectors = []
+        for i, emb in enumerate(embeddings):
+            vector_id = str(start_index + i)
+            metadata = {"text": new_chunks[i], "source": source}
+            vectors.append((vector_id, emb.tolist(), metadata))
+        # Upsert the new vectors to the Pinecone index
+        self.index.upsert(vectors=vectors)
 
     def query(self, query_text, top_k=3):
-        query_embedding = self.model.encode([query_text])
-        query_embedding = np.array(query_embedding).astype('float32')
-        distances, indices = self.index.search(query_embedding, top_k)
+        # Compute the query embedding and convert to list
+        query_embedding = self.model.encode([query_text]).tolist()[0]
+        # Query the Pinecone index
+        result = self.index.query(vector=query_embedding, top_k=top_k, include_metadata=True)
+        matches = result.get("matches", [])
+        # Extract and return metadata from matches
         results = []
-        for idx in indices[0]:
-            if idx < len(self.chunks):
-                results.append(self.chunks[idx])
+        for match in matches:
+            results.append(match.get("metadata", {}))
         return results
 
-    def save_index(self, index_path=None, chunks_path=None):
-        if index_path is not None:
-            self.index_path = index_path
+    def save_index(self, chunks_path=None):
         if chunks_path is not None:
             self.chunks_path = chunks_path
-        if self.index is not None:
-            faiss.write_index(self.index, self.index_path)
+        # Persist the local chunks list (for citation/reference purposes)
         with open(self.chunks_path, "wb") as f:
             pickle.dump(self.chunks, f)
 
     def load_index(self):
-        if os.path.exists(self.index_path) and os.path.exists(self.chunks_path):
-            self.index = faiss.read_index(self.index_path)
+        if os.path.exists(self.chunks_path):
             with open(self.chunks_path, "rb") as f:
                 self.chunks = pickle.load(f)
-            # If chunks are stored as strings from previous versions, convert them.
+            # If chunks were stored as strings in a previous version, convert them.
             if self.chunks and isinstance(self.chunks[0], str):
                 self.chunks = [{"text": chunk, "source": "unknown"} for chunk in self.chunks]
         else:
-            # No persisted data found, start with empty values.
-            self.index = None
-            self.embeddings = None
             self.chunks = []
