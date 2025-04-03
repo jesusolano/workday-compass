@@ -19,6 +19,7 @@ class RAG:
         self.load_index()  # Load persisted chunks if available
 
     def _split_text(self, text):
+        # Default splitting method (by words) if text is not pre-chunked.
         text = text.replace('\n', ' ')
         words = text.split()
         chunks = []
@@ -30,8 +31,16 @@ class RAG:
             start = end - self.chunk_overlap
         return chunks
 
-    def ingest_document(self, text, source="unknown"):
-        new_chunks = self._split_text(text)
+    def ingest_document(self, text, source="unknown", pre_split=False):
+        """
+        Ingest a document by splitting it into chunks, encoding them,
+        and upserting to the Pinecone index.
+        If pre_split is True, it assumes the text is already a single chunk.
+        """
+        if pre_split:
+            new_chunks = [text]
+        else:
+            new_chunks = self._split_text(text)
         start_index = len(self.chunks)
         # Append new chunks locally (for citation metadata)
         for chunk in new_chunks:
@@ -54,10 +63,12 @@ class RAG:
         # Query the Pinecone index
         result = self.index.query(vector=query_embedding, top_k=top_k, include_metadata=True)
         matches = result.get("matches", [])
-        # Extract and return metadata from matches
+        # Extract metadata and include the score in the returned dictionary
         results = []
         for match in matches:
-            results.append(match.get("metadata", {}))
+            match_metadata = dict(match.get("metadata", {}))
+            match_metadata["score"] = match.get("score", 0)
+            results.append(match_metadata)
         return results
 
     def save_index(self, chunks_path=None):
