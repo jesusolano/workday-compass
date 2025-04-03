@@ -2,70 +2,266 @@ import os
 import time
 import streamlit as st
 from datetime import datetime
-from PyPDF2 import PdfReader
 import numpy as np
 import asyncio
 import shutil
 from dotenv import load_dotenv
 import hashlib
+from PyPDF2 import PdfReader
+import logging
+import sys
+import pickle
+import openai
 
-# Load environment variables from .env file.
+# -------------------- Setup and Environment --------------------
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+
 load_dotenv()
 
-# -------------------------------
-# Pinecone Initialization (New API)
-# -------------------------------
-from pinecone import Pinecone, ServerlessSpec
+# Ensure required environment variables are set:
+# - PINECONE_API_KEY, PINECONE_INDEX_NAME, OPENAI_API_KEY, etc.
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
-PINECONE_INDEX_NAME = os.environ["PINECONE_INDEX_NAME"]
-PINECONE_CLOUD = os.environ.get("PINECONE_CLOUD", "aws")
-PINECONE_REGION = os.environ.get("PINECONE_REGION", "us-west-2")
+# Global thresholds
+SIMILARITY_THRESHOLD = 0.55  # Global similarity threshold
 
-pc = Pinecone(api_key=PINECONE_API_KEY)
-
-if PINECONE_INDEX_NAME not in pc.list_indexes().names():
-    pc.create_index(
-        name=PINECONE_INDEX_NAME,
-        dimension=384,  # Adjust to your embedding model (e.g., 384 for all-MiniLM-L6-v2)
-        metric='cosine',  # Using cosine similarity
-        spec=ServerlessSpec(cloud=PINECONE_CLOUD, region=PINECONE_REGION)
-    )
-
-# -------------------------------
-# Other Imports and Configurations
-# -------------------------------
-from rag import RAG  # Ensure your rag.py is updated to use Pinecone logic and returns a score with each result.
-from generator import Generator
-
-# Disable Streamlit's file watcher to help avoid Torch errors.
-os.environ["ST_STREAMLIT_WATCHED_FILES"] = ""
-
-try:
-    asyncio.get_running_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-# Set thresholds.
-UNRELATED_DISTANCE_THRESHOLD = 1.0
-FOLLOWUP_SIMILARITY_THRESHOLD = 0.7
-SIMILARITY_THRESHOLD = 0.7  # Only use results with a score >= 0.7
-
-# File persistence paths for tracking ingestion.
+# File paths for ingestion persistence.
 INGESTED_FILES_PATH = "ingested_files.txt"
 PROCESSING_FILES_PATH = "processing_files.txt"
 
-# ---------- Helper Functions for File Ingestion Persistence ----------
+# -------------------- RAG Class (Retrieval-Augmented Generation) --------------------
+from sentence_transformers import SentenceTransformer
+from pinecone import Pinecone, ServerlessSpec
+
+class RAG:
+    def __init__(self, pinecone_index_name, model_name='all-MiniLM-L6-v2',
+                 chunk_size=500, chunk_overlap=50, chunks_path="chunks.pkl"):
+        self.model = SentenceTransformer(model_name)
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.chunks_path = chunks_path
+        self.chunks = []
+        self.pinecone_index_name = pinecone_index_name
+        # Initialize Pinecone index using the new API.
+        self.index = Pinecone(api_key=os.environ["PINECONE_API_KEY"]).Index(pinecone_index_name)
+        self.load_index()  # Load persisted chunks if available
+
+    def _split_text(self, text):
+        # Default splitting method (by words) if text is not pre-chunked.
+        text = text.replace('\n', ' ')
+        words = text.split()
+        chunks = []
+        start = 0
+        while start < len(words):
+            end = start + self.chunk_size
+            chunk = ' '.join(words[start:end])
+            chunks.append(chunk)
+            start = end - self.chunk_overlap
+        return chunks
+
+    def ingest_document(self, text, source="unknown", pre_split=False):
+        """
+        Ingest a document by splitting it into chunks, encoding them,
+        and upserting to the Pinecone index.
+        If pre_split is True, it assumes the text is already a single chunk.
+        """
+        if pre_split:
+            new_chunks = [text]
+        else:
+            new_chunks = self._split_text(text)
+        start_index = len(self.chunks)
+        # Append new chunks locally (for citation metadata)
+        for chunk in new_chunks:
+            self.chunks.append({"text": chunk, "source": source})
+        # Encode new chunks and ensure float32 format
+        embeddings = self.model.encode(new_chunks, show_progress_bar=True)
+        embeddings = np.array(embeddings).astype('float32')
+        # Prepare vectors for upsert: each is a tuple (id, vector, metadata)
+        vectors = []
+        for i, emb in enumerate(embeddings):
+            vector_id = str(start_index + i)
+            metadata = {"text": new_chunks[i], "source": source}
+            vectors.append((vector_id, emb.tolist(), metadata))
+        # Upsert the new vectors to the Pinecone index
+        self.index.upsert(vectors=vectors)
+
+    def query(self, query_text, top_k=3):
+        # Compute the query embedding and convert to list
+        query_embedding = self.model.encode([query_text]).tolist()[0]
+        # Query the Pinecone index
+        result = self.index.query(vector=query_embedding, top_k=top_k, include_metadata=True)
+        matches = result.get("matches", [])
+        # Extract metadata and include the score in the returned dictionary
+        results = []
+        for match in matches:
+            match_metadata = dict(match.get("metadata", {}))
+            match_metadata["score"] = match.get("score", 0)
+            results.append(match_metadata)
+        return results
+
+    def save_index(self, chunks_path=None):
+        if chunks_path is not None:
+            self.chunks_path = chunks_path
+        # Persist the local chunks list (for citation/reference purposes)
+        with open(self.chunks_path, "wb") as f:
+            pickle.dump(self.chunks, f)
+
+    def load_index(self):
+        if os.path.exists(self.chunks_path):
+            with open(self.chunks_path, "rb") as f:
+                self.chunks = pickle.load(f)
+            # If chunks were stored as strings in a previous version, convert them.
+            if self.chunks and isinstance(self.chunks[0], str):
+                self.chunks = [{"text": chunk, "source": "unknown"} for chunk in self.chunks]
+        else:
+            self.chunks = []
+
+# -------------------- Generator Class --------------------
+class Generator:
+    def __init__(self, model="gpt-4.5-preview", temperature=0.7, max_tokens=2048):
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+
+    def generate_answer(self, history, context, valid_sources):
+        """
+        Generate an answer based on conversation history, context, and valid sources.
+        This function builds a prompt and calls the OpenAI ChatCompletion API.
+        """
+        messages = []
+        system_prompt = (
+            "You are a highly knowledgeable assistant. Answer the user's question based solely on the provided context "
+            "and conversation history. Your response should be detailed and include citations where applicable."
+        )
+        messages.append({"role": "system", "content": system_prompt})
+        # Only include context if available.
+        if context:
+            messages.append({"role": "system", "content": f"Context: {context}"})
+        # Append conversation history.
+        for msg in history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        # Call the OpenAI API.
+        response = openai.ChatCompletion.create(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens
+        )
+        answer = response["choices"][0]["message"]["content"]
+        return answer
+
+# -------------------- Debugging Helper Function --------------------
+def log_embedding_stats(embedding, label="Embedding"):
+    norm = np.linalg.norm(embedding)
+    logging.debug(f"{label} norm: {norm:.4f}")
+    logging.debug(f"{label} sample values: {embedding[:5]}")
+
+# -------------------- Dynamic Chunking and PDF Outline Functions --------------------
+def dynamic_chunk_text(text, max_words=700):
+    """
+    Dynamically splits the input text into chunks based on paragraph boundaries.
+    The text is split by double newlines, and paragraphs are combined until reaching max_words.
+    """
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    chunks = []
+    current_chunk = ""
+    current_words = 0
+    logging.debug(f"dynamic_chunk_text: Found {len(paragraphs)} paragraphs.")
+    for idx, para in enumerate(paragraphs, start=1):
+        para_word_count = len(para.split())
+        logging.debug(f"Paragraph {idx}: {para_word_count} words.")
+        # If a single paragraph is too long, split it further by words.
+        if para_word_count >= max_words:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                logging.debug(f"Chunk finalized with {current_words} words before long paragraph.")
+                current_chunk = ""
+                current_words = 0
+            words = para.split()
+            for i in range(0, len(words), max_words):
+                chunk = " ".join(words[i:i+max_words])
+                chunks.append(chunk)
+                logging.debug(f"Split long paragraph into chunk with {len(chunk.split())} words.")
+            continue
+
+        # If adding this paragraph exceeds max_words, finalize the current chunk.
+        if current_words + para_word_count > max_words:
+            chunks.append(current_chunk.strip())
+            logging.debug(f"Chunk finalized with {current_words} words.")
+            current_chunk = para + "\n\n"
+            current_words = para_word_count
+        else:
+            current_chunk += para + "\n\n"
+            current_words += para_word_count
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+        logging.debug(f"Final chunk added with {current_words} words.")
+
+    logging.debug(f"dynamic_chunk_text: Generated {len(chunks)} chunks.")
+    return chunks
+
+def flatten_outlines(outline_list, pdf_reader, results=None, parent_title=""):
+    if results is None:
+        results = []
+    for item in outline_list:
+        if isinstance(item, list):
+            flatten_outlines(item, pdf_reader, results, parent_title)
+        else:
+            title = getattr(item, "title", "Untitled")
+            full_title = f"{parent_title} > {title}" if parent_title else title
+            try:
+                page_number = pdf_reader.get_destination_page_number(item)
+            except Exception as e:
+                logging.debug(f"Error getting page number for '{full_title}': {e}")
+                page_number = 0
+            results.append((full_title, page_number))
+            logging.debug(f"Added outline item: '{full_title}' at page {page_number}")
+            children = getattr(item, "children", None)
+            if children:
+                if callable(children):
+                    children = children()
+                if isinstance(children, list):
+                    flatten_outlines(children, pdf_reader, results, full_title)
+    return results
+
+def get_outline_sections(pdf_reader):
+    if not hasattr(pdf_reader, "outline"):
+        logging.debug("PDF does not have an outline attribute.")
+        return []
+    outline_obj = pdf_reader.outline
+    if callable(outline_obj):
+        outline_obj = outline_obj()
+    if not outline_obj:
+        logging.debug("Outline object is empty.")
+        return []
+    raw_list = flatten_outlines(outline_obj, pdf_reader)
+    raw_list.sort(key=lambda x: x[1])
+    logging.debug(f"Raw outline list: {raw_list}")
+    sections = []
+    for i, (title, start_page) in enumerate(raw_list):
+        end_page = raw_list[i+1][1] if i < len(raw_list) - 1 else len(pdf_reader.pages)
+        sections.append((title, start_page, end_page))
+    logging.debug(f"Computed outline sections: {sections}")
+    return sections
+
+# -------------------- Persistence Helper Functions --------------------
 def load_file_set(filepath):
     if os.path.exists(filepath):
         with open(filepath, "r") as f:
-            return set(line.strip() for line in f.readlines())
+            file_set = set(line.strip() for line in f.readlines())
+            logging.debug(f"Loaded {len(file_set)} entries from {filepath}.")
+            return file_set
     return set()
 
 def append_to_file(filepath, identifier):
     with open(filepath, "a") as f:
         f.write(identifier + "\n")
+    logging.debug(f"Appended identifier {identifier} to {filepath}.")
 
 def remove_from_file(filepath, identifier):
     if not os.path.exists(filepath):
@@ -76,13 +272,16 @@ def remove_from_file(filepath, identifier):
         for line in lines:
             if line.strip() != identifier:
                 f.write(line)
+    logging.debug(f"Removed identifier {identifier} from {filepath}.")
 
 def compute_file_hash(filepath):
     hasher = hashlib.sha256()
     with open(filepath, "rb") as f:
         while chunk := f.read(8192):
             hasher.update(chunk)
-    return hasher.hexdigest()
+    file_hash = hasher.hexdigest()
+    logging.debug(f"Computed hash for {filepath}: {file_hash}")
+    return file_hash
 
 def load_ingested_files():
     return load_file_set(INGESTED_FILES_PATH)
@@ -91,27 +290,32 @@ def save_ingested_files(file_set):
     with open(INGESTED_FILES_PATH, "w") as f:
         for identifier in file_set:
             f.write(identifier + "\n")
+    logging.debug(f"Saved {len(file_set)} ingested file identifiers to {INGESTED_FILES_PATH}.")
 
-# ---------- Helper Function for Citation Formatting ----------
+# -------------------- Conversation Management Functions --------------------
 def format_citation(source):
-    if " (page " in source:
-        file_name, page_info = source.split(" (page ", 1)
-        page_info = " (page " + page_info
-    else:
-        file_name = source
-        page_info = ""
-    if file_name.lower().endswith(".pdf"):
-        link = f"/assets/{file_name}"
-    else:
-        link = f"documents/{file_name}"
-    return f"[{file_name}]({link}){page_info}"
+    """
+    Given a source string formatted as:
+    "Filename.pdf | Section: ... | Pages: ... | Chunk: ..."
+    this function extracts the file name, section, and pages (omitting the chunk info)
+    and returns a clickable Markdown link.
+    """
+    parts = [p.strip() for p in source.split("|")]
+    if len(parts) < 3:
+        # Fallback if not in expected format.
+        return f"[{source}](documents/{source})"
+    main_file = parts[0]
+    section = parts[1]  # Expected to be like "Section: ..."
+    pages = parts[2]    # Expected to be like "Pages: ..."
+    link_text = f"{main_file} | {section} | {pages}"
+    link_href = f"documents/{main_file}"
+    return f"[{link_text}]({link_href})"
 
-# ---------- Conversation Management Functions ----------
 def create_new_conversation():
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    title = f"Conversation {timestamp}"
-    new_thread = {"title": title, "history": []}
-    st.session_state["conversation_threads"].append(new_thread)
+    new_thread = {"title": f"Conversation {timestamp}", "history": []}
+    st.session_state.setdefault("conversation_threads", []).append(new_thread)
+    logging.debug(f"Created new conversation with title: {new_thread['title']}")
     return len(st.session_state["conversation_threads"]) - 1
 
 def get_active_thread():
@@ -124,8 +328,9 @@ def rename_conversation_auto(thread):
     if thread["title"].startswith("Conversation "):
         for msg in thread["history"]:
             if msg["role"] == "user" and msg["content"].strip():
-                text = msg["content"].strip()
-                thread["title"] = (text[:30] + "...") if len(text) > 30 else text
+                short_text = msg["content"].strip()
+                thread["title"] = (short_text[:30] + "...") if len(short_text) > 30 else short_text
+                logging.debug(f"Renamed conversation to: {thread['title']}")
                 return
         thread["title"] = "Untitled conversation"
 
@@ -136,6 +341,7 @@ def handle_delete_conversation():
     for i, thread in enumerate(st.session_state.get("conversation_threads", [])):
         if thread["title"] == delete_choice:
             del st.session_state["conversation_threads"][i]
+            logging.debug(f"Deleted conversation: {delete_choice}")
             if st.session_state.get("active_conversation_index") == i:
                 st.session_state["active_conversation_index"] = 0 if st.session_state["conversation_threads"] else None
             elif st.session_state.get("active_conversation_index") is not None and st.session_state["active_conversation_index"] > i:
@@ -148,7 +354,7 @@ def handle_delete_conversation():
 
 def get_conversation_html():
     active_thread = get_active_thread()
-    if active_thread is None:
+    if not active_thread:
         return ""
     html = '<div class="chat-container">'
     for msg in active_thread["history"]:
@@ -156,25 +362,15 @@ def get_conversation_html():
             html += f'<div class="chat-bubble user-bubble"><strong>User:</strong> {msg["content"]}</div><div class="clearfix"></div>'
         else:
             html += f'<div class="chat-bubble assistant-bubble"><strong>Assistant:</strong> {msg["content"]}</div><div class="clearfix"></div>'
-    html += '</div>'
+    html += "</div>"
     return html
 
-def is_followup_query(history):
-    user_msgs = [m for m in history if m["role"] == "user"]
-    if len(user_msgs) < 2:
-        return False
-    previous_query = user_msgs[-2]["content"]
-    new_query = user_msgs[-1]["content"]
-    new_emb = st.session_state["rag"].model.encode([new_query])[0]
-    prev_emb = st.session_state["rag"].model.encode([previous_query])[0]
-    sim = np.dot(new_emb, prev_emb) / (np.linalg.norm(new_emb) * np.linalg.norm(prev_emb))
-    return sim >= FOLLOWUP_SIMILARITY_THRESHOLD
-
-# ---------- Document Ingestion Function ----------
+# -------------------- Document Ingestion Function --------------------
 def ingest_documents():
     docs_dir = "documents"
     if not os.path.exists(docs_dir):
-        st.warning(f"Directory '{docs_dir}' not found. Please create it and add your documents.")
+        st.warning(f"Directory '{docs_dir}' not found.")
+        logging.warning(f"Directory '{docs_dir}' not found.")
         return
 
     ingested_files = load_ingested_files()
@@ -187,19 +383,38 @@ def ingest_documents():
             filepath = os.path.join(docs_dir, filename)
             if os.path.isfile(filepath):
                 file_hash = compute_file_hash(filepath)
-                if file_hash in ingested_files or file_hash in processing_files:
-                    continue  # Skip already processed files.
+                if file_hash in ingested_files:
+                    logging.debug(f"Skipping already ingested file: {filename}")
+                    continue
+                if file_hash in processing_files:
+                    logging.debug(f"File hash {file_hash} found in processing_files.txt for file {filename}. Removing stale entry and reprocessing.")
+                    remove_from_file(PROCESSING_FILES_PATH, file_hash)
                 append_to_file(PROCESSING_FILES_PATH, file_hash)
                 new_files_found = True
+
                 try:
                     if filename.lower().endswith(".txt"):
+                        logging.debug(f"Ingesting text file: {filename}")
                         progress_placeholder.text(f"Ingesting {filename}...")
                         with open(filepath, "r", encoding="utf-8") as f:
                             text = f.read()
-                        st.session_state["rag"].ingest_document(text, source=filename)
+                        words = text.split()
+                        if len(words) > 300:
+                            chunks = dynamic_chunk_text(text, max_words=700)
+                            for ch_idx, chunk in enumerate(chunks, start=1):
+                                meta_str = f"{filename} | Chunk: {ch_idx}"
+                                # Use pre_split=True since our dynamic chunking already splits the text.
+                                st.session_state["rag"].ingest_document(chunk, source=meta_str, pre_split=True)
+                                logging.debug(f"Ingested chunk {ch_idx} of text file {filename} ({len(chunk.split())} words)")
+                                time.sleep(0.3)
+                        else:
+                            meta_str = f"{filename} | Entire Document"
+                            st.session_state["rag"].ingest_document(text, source=meta_str, pre_split=True)
+                            logging.debug(f"Ingested entire text file: {filename} ({len(words)} words)")
                         progress_placeholder.text(f"Ingested {filename}")
                         time.sleep(0.5)
                     elif filename.lower().endswith(".pdf"):
+                        logging.debug(f"Ingesting PDF file: {filename}")
                         assets_dir = "assets"
                         if not os.path.exists(assets_dir):
                             os.makedirs(assets_dir)
@@ -209,28 +424,45 @@ def ingest_documents():
                         progress_placeholder.text(f"Ingesting {filename}...")
                         with open(filepath, "rb") as f:
                             pdf_reader = PdfReader(f)
-                            for i, page in enumerate(pdf_reader.pages, start=1):
-                                progress_placeholder.text(f"Ingesting {filename} [page {i}]")
-                                page_text = page.extract_text()
-                                if page_text:
-                                    st.session_state["rag"].ingest_document(page_text, source=f"{filename} (page {i})")
-                                time.sleep(0.3)
+                            sections = get_outline_sections(pdf_reader)
+                            if not sections:
+                                sections = [("Entire Document", 0, len(pdf_reader.pages))]
+                                logging.debug(f"No outline sections found for {filename}, using entire document.")
+                            for sec_idx, (section_title, start_page, end_page) in enumerate(sections, start=1):
+                                logging.debug(f"Ingesting section {sec_idx} of {filename}: {section_title} (pages {start_page}-{end_page})")
+                                progress_placeholder.text(f"Ingesting {filename} [section {sec_idx}: {section_title}]")
+                                section_text = ""
+                                for pg in range(start_page, end_page):
+                                    extracted = pdf_reader.pages[pg].extract_text() or ""
+                                    section_text += extracted + "\n\n"
+                                chunks = dynamic_chunk_text(section_text, max_words=700)
+                                logging.debug(f"Section '{section_title}' split into {len(chunks)} chunks.")
+                                for ch_idx, chunk in enumerate(chunks, start=1):
+                                    if not chunk.strip():
+                                        continue
+                                    meta_str = f"{filename} | Section: {section_title} | Pages: {start_page}-{end_page} | Chunk: {ch_idx}"
+                                    st.session_state["rag"].ingest_document(chunk, source=meta_str, pre_split=True)
+                                    logging.debug(f"Ingested chunk {ch_idx} of section '{section_title}' from {filename} ({len(chunk.split())} words)")
+                                    time.sleep(0.3)
                         progress_placeholder.text(f"Ingested {filename}")
                         time.sleep(0.5)
                     else:
                         st.warning(f"Unsupported file type: {filename}")
+                        logging.warning(f"Unsupported file type: {filename}")
                     append_to_file(INGESTED_FILES_PATH, file_hash)
                     remove_from_file(PROCESSING_FILES_PATH, file_hash)
                 except Exception as e:
                     st.error(f"Error ingesting {filename}: {e}")
+                    logging.error(f"Error ingesting {filename}: {e}")
     if new_files_found:
         progress_placeholder.text("")
         st.session_state["rag"].save_index()
         st.success("New documents ingested! Index updated!")
+        logging.info("New documents ingested and index updated.")
     else:
-        pass
+        logging.info("No new documents found for ingestion.")
 
-# ---------- Main Function ----------
+# -------------------- Main Application --------------------
 def main():
     st.markdown(
         """
@@ -241,7 +473,6 @@ def main():
                 background-color: #ffffff;
                 color: #000000;
             }
-            /* Sidebar styling */
             [data-testid="stSidebar"] {
                 background-color: #1E4258;
             }
@@ -261,7 +492,6 @@ def main():
                 background-color: #ffffff !important;
                 color: #222222 !important;
             }
-            /* Chat container styling without background color */
             .chat-container {
                 padding: 10px;
                 max-width: 800px;
@@ -296,11 +526,14 @@ def main():
     )
 
     if "rag" not in st.session_state:
-        st.session_state["rag"] = RAG(pinecone_index_name=PINECONE_INDEX_NAME)
+        st.session_state["rag"] = RAG(pinecone_index_name=os.environ["PINECONE_INDEX_NAME"])
+        logging.debug("Initialized RAG instance.")
     if "generator" not in st.session_state:
         st.session_state["generator"] = Generator()
+        logging.debug("Initialized Generator instance.")
     if "conversation_threads" not in st.session_state:
         st.session_state["conversation_threads"] = []
+        logging.debug("Initialized conversation threads.")
     if "active_conversation_index" not in st.session_state:
         st.session_state["active_conversation_index"] = None
     if "delete_convo" not in st.session_state:
@@ -359,9 +592,10 @@ def main():
             key="user_text_input",
             placeholder="Type your message here...",
             height=100,
-            label_visibility="collapsed"
+            label_visibility="collapsed",
         )
         send_clicked = st.form_submit_button("Send")
+
     if send_clicked and user_input.strip():
         active_thread = get_active_thread()
         if active_thread:
@@ -371,35 +605,47 @@ def main():
             conversation_html = get_conversation_html()
             conversation_placeholder.markdown(conversation_html, unsafe_allow_html=True)
 
-            # Insert temporary plain text immediately below the user's query.
+            logging.debug(f"User query: {msg}")
+
             temp_msg = "<p style='font-style: italic; color: #555555; margin: 0;'>Searching the knowledge base...</p>"
-            # Append the temporary text right after the conversation HTML.
             conversation_placeholder.markdown(conversation_html + temp_msg, unsafe_allow_html=True)
 
-            # Record start time and enforce a minimum display duration.
             start_time = time.time()
             results = st.session_state["rag"].query(msg, top_k=3)
             elapsed = time.time() - start_time
-            if elapsed < 2:
-                time.sleep(2 - elapsed)
+            logging.debug(f"Query returned {len(results)} results in {elapsed:.2f} seconds.")
+            if results:
+                top_chunk = results[0]
+                logging.debug(f"Top chunk content: {top_chunk.get('text', '')}")
+            if elapsed < 10:
+                time.sleep(10 - elapsed)
 
-            # Filter results based on similarity threshold.
-            filtered_results = [r for r in results if r.get("score", 0) >= SIMILARITY_THRESHOLD]
+            all_scores = [r.get("score", 0) for r in results]
+            logging.debug("All result scores: " + ", ".join([f"{score:.4f}" for score in all_scores]))
+            best_score = max(all_scores) if all_scores else 0
+            logging.debug(f"Best similarity score: {best_score:.4f}")
+            best_distance = 1 - best_score
+            unrelated_distance_threshold = 1.0
+            logging.debug(f"Best distance: {best_distance:.4f} (threshold: {unrelated_distance_threshold})")
+            if best_distance > unrelated_distance_threshold:
+                logging.debug("Best distance exceeds threshold, treating as no relevant documents found.")
+                filtered_results = []
+            else:
+                filtered_results = [r for r in results if r.get("score", 0) >= SIMILARITY_THRESHOLD]
+            logging.debug(f"Filtered to {len(filtered_results)} results using similarity threshold {SIMILARITY_THRESHOLD}.")
 
-            # Re-render conversation without the temporary text.
             conversation_placeholder.markdown(get_conversation_html(), unsafe_allow_html=True)
 
             if not filtered_results:
-                context = (
-                    "We could not find relevant information from our internal knowledge base regarding your query. "
-                    "Based on general knowledge, here is what we found:"
-                )
+                context = ""
                 valid_sources = []
+                logging.debug("No relevant documents found based on the similarity threshold and best distance.")
             else:
                 retrieved_chunks = [r.get("text", "") for r in filtered_results]
                 context = " ".join(retrieved_chunks)
                 sources = [r.get("source", "unknown") for r in filtered_results]
                 valid_sources = [s for s in sources if s and s.strip().lower() != "unknown"]
+                logging.debug(f"Relevant documents found with sources: {valid_sources}")
 
             full_answer = st.session_state["generator"].generate_answer(active_thread["history"], context, valid_sources)
             if not filtered_results:
@@ -420,6 +666,7 @@ def main():
                 time.sleep(0.005)
             active_thread["history"].append({"role": "assistant", "type": "text", "content": full_answer})
             conversation_placeholder.markdown(get_conversation_html(), unsafe_allow_html=True)
+            logging.debug("Assistant response generated and appended to conversation history.")
 
 if __name__ == "__main__":
     main()

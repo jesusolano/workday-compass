@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Generator:
-    def __init__(self, model_name="gpt-4-turbo", temperature=0.7):
+    def __init__(self, model_name="gpt-4.5-preview", temperature=0.7):
         self.model_name = model_name
         self.temperature = temperature
         openai.api_key = os.getenv("OPENAI_API_KEY")
