@@ -8,3 +8,4 @@ openai==0.28
 python-dotenv
 pinecone
 pdfplumber
+accelerate
