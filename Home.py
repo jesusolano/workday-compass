@@ -173,7 +173,7 @@ def main():
                     f'<div class="clearfix"></div>'
                 )
                 conversation_placeholder.markdown(typed_html, unsafe_allow_html=True)
-                time.sleep(0.005)
+                time.sleep(0.0025)
 
             # Prepare citation (if available) from the top filtered result
             citation = None

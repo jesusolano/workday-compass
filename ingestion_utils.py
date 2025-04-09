@@ -405,9 +405,9 @@ def get_conversation_html():
                 citation = msg["citation"]
                 formatted_content = smart_format_text(citation["content"])
                 html += (
-                    f'<div class="chat-bubble citation-bubble">'
+                    f'<div class="chat-bubble citation-bubble" style="border-radius: 15px; padding: 10px; background-color: #f8f8f8;">'
                     f'<details><summary style="font-size: 14px; color: #666;">Top Citation: {format_citation(citation["header"])}</summary>'
-                    f'{formatted_content}'
+                    f'<div style="font-size: 13px; padding: 8px;">{formatted_content}</div>'
                     f'</details></div>'
                 )
         html += '<div class="clearfix"></div>'
