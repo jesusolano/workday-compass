@@ -1,4 +1,15 @@
 import os
+# Force CPU-only mode by hiding any GPUs
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# Load environment variables for local development (if available)
+from dotenv import load_dotenv
+load_dotenv()
+
+import torch
+# Disable MKLDNN to prevent unsupported operations during device conversion
+torch.backends.mkldnn.enabled = False
+
 import time
 import re
 import pickle
@@ -10,14 +21,6 @@ from collections import Counter
 import numpy as np
 import pdfplumber
 from PyPDF2 import PdfReader
-from dotenv import load_dotenv
-import torch
-
-# Load environment variables for local development (if available)
-load_dotenv()
-
-# Disable MKLDNN which may cause issues when moving models to CPU
-torch.backends.mkldnn.enabled = False
 
 # Global paths and threshold
 SIMILARITY_THRESHOLD = 0.55
@@ -216,12 +219,9 @@ from pinecone import Pinecone
 class RAG:
     def __init__(self, pinecone_index_name, model_name='all-MiniLM-L6-v2',
                  chunk_size=500, chunk_overlap=50, chunks_path="chunks.pkl"):
-        # Attempt to force model to CPU; if that fails, fall back gracefully.
-        try:
-            self.model = SentenceTransformer(model_name, device="cpu")
-        except NotImplementedError as e:
-            logger.warning("Explicit device assignment caused NotImplementedError; falling back to default device.")
-            self.model = SentenceTransformer(model_name)
+        # Do not pass an explicit device so that the model auto-selects CPU.
+        # With CUDA hidden, it should run on CPU.
+        self.model = SentenceTransformer(model_name)
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.chunks_path = chunks_path
