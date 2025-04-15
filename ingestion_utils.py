@@ -212,7 +212,8 @@ from pinecone import Pinecone
 class RAG:
     def __init__(self, pinecone_index_name, model_name='all-MiniLM-L6-v2',
                  chunk_size=500, chunk_overlap=50, chunks_path="chunks.pkl"):
-        self.model = SentenceTransformer(model_name)
+        # Force the model to load on CPU to avoid device conversion errors in the current environment
+        self.model = SentenceTransformer(model_name, device="cpu")
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.chunks_path = chunks_path
