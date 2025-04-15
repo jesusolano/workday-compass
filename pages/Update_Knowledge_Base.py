@@ -9,9 +9,9 @@ def main():
     st.title("Document Upload")
     st.write("Upload your documents to update the internal knowledge base.")
 
-    # Ensure 'rag' is initialized in session state
+    # Ensure 'rag' is initialized in session state using Streamlit secrets
     if "rag" not in st.session_state:
-        st.session_state["rag"] = RAG(pinecone_index_name=os.environ.get("PINECONE_INDEX_NAME", "default_index"))
+        st.session_state["rag"] = RAG(pinecone_index_name=st.secrets["PINECONE_INDEX_NAME"])
 
     # File uploader that accepts multiple files
     uploaded_files = st.file_uploader("Choose documents", accept_multiple_files=True)

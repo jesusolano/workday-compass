@@ -12,7 +12,7 @@ import pdfplumber
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
 
-# Load environment variables
+# Load environment variables for local development (if available)
 load_dotenv()
 
 # Global paths and threshold
@@ -26,13 +26,10 @@ logger.setLevel(logging.DEBUG)
 
 # If the logger doesn't already have handlers, add one for file logging.
 if not logger.handlers:
-    # Create a file handler that logs debug and higher level messages.
     file_handler = logging.FileHandler("document_ingestion.log")
     file_handler.setLevel(logging.DEBUG)
-    # Create a formatter and set it for the file handler.
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(formatter)
-    # Add the handler to the logger.
     logger.addHandler(file_handler)
 
 # -------------------- Helper Functions --------------------
@@ -221,7 +218,8 @@ class RAG:
         self.chunks_path = chunks_path
         self.chunks = []
         self.pinecone_index_name = pinecone_index_name
-        self.index = Pinecone(api_key=os.environ["PINECONE_API_KEY"]).Index(pinecone_index_name)
+        # Retrieve the Pinecone API key from Streamlit secrets
+        self.index = Pinecone(api_key=st.secrets["PINECONE_API_KEY"]).Index(pinecone_index_name)
         self.load_index()
 
     def _split_text(self, text):
@@ -285,7 +283,8 @@ class Generator:
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
-        openai.api_key = os.getenv("OPENAI_API_KEY")
+        # Retrieve OpenAI API key from Streamlit secrets
+        openai.api_key = st.secrets["OPENAI_API_KEY"]
 
     def generate_answer(self, history, context, valid_sources):
         import openai

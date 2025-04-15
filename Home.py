@@ -16,7 +16,7 @@ from ingestion_utils import (
     format_citation
 )
 
-# Configure logging
+# Configure logging (if needed)
 # logging.basicConfig(
 #     level=logging.DEBUG,
 #     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -64,7 +64,7 @@ def main():
 
     # Initialize session state for RAG and Generator if not already set
     if "rag" not in st.session_state:
-        st.session_state["rag"] = RAG(pinecone_index_name=os.environ["PINECONE_INDEX_NAME"])
+        st.session_state["rag"] = RAG(pinecone_index_name=st.secrets["PINECONE_INDEX_NAME"])
     if "generator" not in st.session_state:
         st.session_state["generator"] = Generator()
 
