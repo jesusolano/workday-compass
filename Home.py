@@ -17,11 +17,11 @@ from ingestion_utils import (
 )
 
 # Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    stream=sys.stdout
-)
+# logging.basicConfig(
+#     level=logging.DEBUG,
+#     format='%(asctime)s - %(levelname)s - %(message)s',
+#     stream=sys.stdout
+# )
 
 def main():
     st.markdown(

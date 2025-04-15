@@ -20,6 +20,21 @@ SIMILARITY_THRESHOLD = 0.55
 INGESTED_FILES_PATH = "ingested_files.txt"
 PROCESSING_FILES_PATH = "processing_files.txt"
 
+# Create and configure a logger for this module.
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# If the logger doesn't already have handlers, add one for file logging.
+if not logger.handlers:
+    # Create a file handler that logs debug and higher level messages.
+    file_handler = logging.FileHandler("document_ingestion.log")
+    file_handler.setLevel(logging.DEBUG)
+    # Create a formatter and set it for the file handler.
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    # Add the handler to the logger.
+    logger.addHandler(file_handler)
+
 # -------------------- Helper Functions --------------------
 def compute_file_hash(filepath):
     hasher = hashlib.sha256()
@@ -297,6 +312,7 @@ def ingest_documents():
     docs_dir = "documents"
     if not os.path.exists(docs_dir):
         st.warning(f"Directory '{docs_dir}' not found.")
+        logger.warning(f"Directory '{docs_dir}' not found.")
         return
 
     ingested_files = load_ingested_files()
@@ -304,15 +320,19 @@ def ingest_documents():
     new_files_found = False
     progress_placeholder = st.empty()
 
+    logger.info("Starting document ingestion process...")
     with st.spinner("Ingesting new documents..."):
         for filename in os.listdir(docs_dir):
             filepath = os.path.join(docs_dir, filename)
             if not os.path.isfile(filepath):
                 continue
             file_hash = compute_file_hash(filepath)
+            logger.debug(f"Found file: {filename} with hash: {file_hash}.")
             if file_hash in ingested_files:
+                logger.info(f"Skipping already ingested file: {filename}.")
                 continue
             if file_hash in processing_files:
+                logger.info(f"File {filename} is in processing queue, removing previous entry.")
                 remove_from_file(PROCESSING_FILES_PATH, file_hash)
             append_to_file(PROCESSING_FILES_PATH, file_hash)
             new_files_found = True
@@ -320,24 +340,29 @@ def ingest_documents():
             try:
                 if filename.lower().endswith(".txt"):
                     progress_placeholder.text(f"Ingesting {filename}...")
+                    logger.info(f"Ingesting text file: {filename}.")
                     with open(filepath, "r", encoding="utf-8") as f:
                         text = f.read()
                     chunks = dynamic_chunk_text(text, max_words=700)
-                    for chunk in chunks:
-                        meta_str = f"{filename} | Section: Full Document"
+                    for i, chunk in enumerate(chunks):
+                        meta_str = f"{filename} | Section: Full Document | Chunk: {i+1}/{len(chunks)}"
+                        logger.debug(f"Ingesting chunk {i+1} of {len(chunks)} from text file: {filename}.")
                         st.session_state["rag"].ingest_document(chunk, source=meta_str, pre_split=True)
                         time.sleep(0.3)
                     progress_placeholder.text(f"Ingested {filename}")
+                    logger.info(f"Successfully ingested text file: {filename}.")
                     time.sleep(0.5)
 
                 elif filename.lower().endswith(".pdf"):
                     progress_placeholder.text(f"Ingesting {filename}...")
+                    logger.info(f"Ingesting PDF file: {filename}.")
                     with open(filepath, "rb") as f:
                         pdf_reader = PdfReader(f)
                         sections = get_outline_sections(pdf_reader)
 
                     with pdfplumber.open(filepath) as pdf:
                         if sections:
+                            logger.info(f"PDF file {filename} has outline sections. Total sections: {len(sections)}")
                             for title, start_page, end_page in sections:
                                 page_texts = []
                                 for i in range(start_page, end_page):
@@ -348,39 +373,50 @@ def ingest_documents():
                                             continue
                                         page_texts.append(page_text)
                                 if not page_texts:
+                                    logger.warning(f"Section '{title}' in {filename} is empty, skipping.")
                                     continue
                                 page_texts = remove_headers_and_footers(page_texts)
                                 section_text = "\n\n".join(page_texts)
                                 chunks = dynamic_chunk_text(section_text, max_words=700)
-                                for chunk in chunks:
-                                    meta_str = f"{filename} | Section: {title}"
+                                for i, chunk in enumerate(chunks):
+                                    meta_str = f"{filename} | Section: {title} | Chunk: {i+1}/{len(chunks)}"
+                                    logger.debug(f"Ingesting chunk {i+1} of {len(chunks)} from section '{title}' in PDF file: {filename}.")
                                     st.session_state["rag"].ingest_document(chunk, source=meta_str, pre_split=True)
                                     time.sleep(0.3)
                         else:
+                            logger.info(f"PDF file {filename} does not have outline sections, ingesting by pages.")
                             for page_idx, page in enumerate(pdf.pages):
                                 page_text = page.extract_text() or ""
                                 if not page_text.strip():
                                     continue
                                 page_text = remove_headers_and_footers([page_text])[0]
                                 page_chunks = dynamic_chunk_text(page_text, max_words=700)
-                                for chunk in page_chunks:
-                                    meta_str = f"{filename} | Page: {page_idx + 1}"
+                                for i, chunk in enumerate(page_chunks):
+                                    meta_str = f"{filename} | Page: {page_idx + 1} | Chunk: {i+1}/{len(page_chunks)}"
+                                    logger.debug(f"Ingesting chunk {i+1} of {len(page_chunks)} from page {page_idx+1} in PDF file: {filename}.")
                                     st.session_state["rag"].ingest_document(chunk, source=meta_str, pre_split=True)
                                     time.sleep(0.3)
                     progress_placeholder.text(f"Ingested {filename}")
+                    logger.info(f"Successfully ingested PDF file: {filename}.")
                     time.sleep(0.5)
 
                 else:
                     st.warning(f"Unsupported file type: {filename}")
+                    logger.warning(f"Unsupported file type for file: {filename}.")
 
                 append_to_file(INGESTED_FILES_PATH, file_hash)
                 remove_from_file(PROCESSING_FILES_PATH, file_hash)
+                logger.info(f"File {filename} ingestion completed and updated in ingested list.")
             except Exception as e:
                 st.error(f"Error ingesting {filename}: {e}")
-    if new_files_found:
-        progress_placeholder.text("")
-        st.session_state["rag"].save_index()
-        st.success("New documents ingested! Index updated!")
+                logger.error(f"Error ingesting {filename}: {e}", exc_info=True)
+        if new_files_found:
+            progress_placeholder.text("")
+            st.session_state["rag"].save_index()
+            st.success("New documents ingested! Index updated!")
+            logger.info("Document ingestion process completed successfully. Index updated.")
+        else:
+            logger.info("No new documents found for ingestion.")
 
 # -------------------- Conversation Functions --------------------
 def get_conversation_html():
