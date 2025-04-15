@@ -1,8 +1,8 @@
 streamlit
-sentence-transformers
+sentence-transformers==2.2.2
 numpy
 transformers
-torch
+torch==1.13.1
 PyPDF2
 openai==0.28
 python-dotenv

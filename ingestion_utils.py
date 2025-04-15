@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import torch
-# Disable MKLDNN to prevent unsupported operations during device conversion
+# Disable JIT profiling executor and MKLDNN to avoid backend conversion issues
+torch._C._jit_set_profiling_executor(False)
 torch.backends.mkldnn.enabled = False
 
 import time
@@ -219,8 +220,7 @@ from pinecone import Pinecone
 class RAG:
     def __init__(self, pinecone_index_name, model_name='all-MiniLM-L6-v2',
                  chunk_size=500, chunk_overlap=50, chunks_path="chunks.pkl"):
-        # Do not pass an explicit device so that the model auto-selects CPU.
-        # With CUDA hidden, it should run on CPU.
+        # Let the model auto-select the device after hiding GPUs.
         self.model = SentenceTransformer(model_name)
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
