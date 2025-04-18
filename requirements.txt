@@ -1,8 +1,9 @@
 streamlit
+huggingface-hub==0.25.2 
 sentence-transformers==2.2.2
 numpy
 transformers
-torch==1.13.1
+torch>=2.4.0,<3.0
 PyPDF2
 openai==0.28
 python-dotenv
