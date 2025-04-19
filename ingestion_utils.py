@@ -23,6 +23,12 @@ import numpy as np
 import pdfplumber
 from PyPDF2 import PdfReader
 
+from rank_bm25 import BM25Okapi
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:
+    BM25Okapi = None
+
 # Global paths and threshold
 SIMILARITY_THRESHOLD = 0.55
 INGESTED_FILES_PATH = "ingested_files.txt"
@@ -259,16 +265,66 @@ class RAG:
             metadata = {"text": new_chunks[i], "source": source}
             vectors.append((vector_id, emb.tolist(), metadata))
         self.index.upsert(vectors=vectors)
+        self._build_sparse_index()
 
-    def query(self, query_text, top_k=3):
-        query_embedding = self.model.encode([query_text]).tolist()[0]
-        result = self.index.query(vector=query_embedding, top_k=top_k, include_metadata=True)
-        matches = result.get("matches", [])
-        results = []
-        for match in matches:
-            meta = dict(match.get("metadata", {}))
-            meta["score"] = match.get("score", 0)
-            results.append(meta)
+    def query(self, query_text, top_k=3, alpha=0.5, dense_k=10, sparse_k=10):
+        # — dense retrieval via Pinecone —
+        q_emb = self.model.encode([query_text])[0].astype('float32')
+        dense_resp = self.index.query(vector=q_emb.tolist(),
+                                      top_k=dense_k,
+                                      include_metadata=True)
+        dense_matches = [{
+            "id": m["id"],
+            "score": m["score"],
+            "text": m["metadata"]["text"],
+            "source": m["metadata"]["source"]
+        } for m in dense_resp["matches"]]
+
+        # — sparse retrieval via BM25, if built —
+        sparse_matches = []
+        if BM25Okapi and getattr(self, "bm25", None):
+            tokens = query_text.split()
+            sparse_scores = self.bm25.get_scores(tokens)
+            top_sparse = sorted(enumerate(sparse_scores),
+                                key=lambda x: x[1],
+                                reverse=True)[:sparse_k]
+            sparse_matches = [{
+                "id": str(idx),
+                "score": score,
+                "text": self.chunks[idx]["text"],
+                "source": self.chunks[idx]["source"]
+            } for idx, score in top_sparse]
+
+        # — normalize scores to [0,1] —
+        def normalize(xs):
+            if not xs: return {}
+            vals = [m["score"] for m in xs]
+            lo, hi = min(vals), max(vals)
+            if hi - lo < 1e-6:
+                return {m["id"]: 1.0 for m in xs}
+            return {m["id"]: (m["score"] - lo) / (hi - lo) for m in xs}
+
+        d_norm = normalize(dense_matches)
+        s_norm = normalize(sparse_matches)
+
+        # — merge by weighted sum —
+        merged = {}
+        for m in dense_matches + sparse_matches:
+            d_sc = d_norm.get(m["id"], 0.0)
+            s_sc = s_norm.get(m["id"], 0.0)
+            combined = alpha * d_sc + (1 - alpha) * s_sc
+            # keep highest combined score for each chunk
+            if m["id"] not in merged or merged[m["id"]]["score"] < combined:
+                merged[m["id"]] = {
+                    "text": m["text"],
+                    "source": m["source"],
+                    "score": combined
+                }
+
+        # — sort and return top_k —
+        results = sorted(merged.values(),
+                         key=lambda x: x["score"],
+                         reverse=True)[:top_k]
         return results
 
     def save_index(self, chunks_path=None):
@@ -285,6 +341,18 @@ class RAG:
                 self.chunks = [{"text": c, "source": "unknown"} for c in self.chunks]
         else:
             self.chunks = []
+            # build sparse index only if BM25Okapi is available
+            if BM25Okapi:
+                self._build_sparse_index()
+
+    def _build_sparse_index(self):
+        # no chunks → skip
+        if not self.chunks:
+            self.bm25 = None
+            return
+        # build BM25
+        corpus = [c["text"].split() for c in self.chunks]
+        self.bm25 = BM25Okapi(corpus)
 
 class Generator:
     def __init__(self, model="gpt-3.5-turbo", temperature=0.7, max_tokens=2048):
@@ -445,15 +513,16 @@ def get_conversation_html():
                 f'<strong>Assistant:</strong> {msg["content"]}'
                 f'</div>'
             )
-            if "citation" in msg and msg["citation"]:
-                citation = msg["citation"]
-                formatted_content = smart_format_text(citation["content"])
-                html += (
-                    f'<div class="chat-bubble citation-bubble" style="border-radius: 15px; padding: 10px; background-color: #f8f8f8;">'
-                    f'<details><summary style="font-size: 14px; color: #666;">Top Citation: {format_citation(citation["header"])}</summary>'
-                    f'<div style="font-size: 13px; padding: 8px;">{formatted_content}</div>'
-                    f'</details></div>'
-                )
+            # Render one collapsible section per citation
+            if "citations" in msg and msg["citations"]:
+                for citation in msg["citations"]:
+                    formatted_content = smart_format_text(citation["content"])
+                    html += (
+                        f'<div class="chat-bubble citation-bubble" style="border-radius: 15px; padding: 10px; background-color: #f8f8f8;">'
+                        f'<details><summary style="font-size: 14px; color: #666;">Citation: {format_citation(citation["header"])}</summary>'
+                        f'<div style="font-size: 13px; padding: 8px;">{formatted_content}</div>'
+                        f'</details></div>'
+                    )
         html += '<div class="clearfix"></div>'
     html += "</div>"
     return html

@@ -1,5 +1,5 @@
 streamlit
-huggingface-hub==0.25.2 
+huggingface-hub==0.25.2
 sentence-transformers==2.2.2
 numpy
 transformers
@@ -10,3 +10,4 @@ python-dotenv
 pinecone
 pdfplumber
 accelerate
+rank-bm25

@@ -16,13 +16,6 @@ from ingestion_utils import (
     format_citation
 )
 
-# Configure logging (if needed)
-# logging.basicConfig(
-#     level=logging.DEBUG,
-#     format='%(asctime)s - %(levelname)s - %(message)s',
-#     stream=sys.stdout
-# )
-
 def main():
     st.markdown(
         """
@@ -91,6 +84,45 @@ def main():
     )
 
     # Sidebar for conversation selection
+    # ─── Retrieval Controls ──────────────────────────────────────
+    st.sidebar.markdown("## Retrieval Settings")
+    alpha = st.sidebar.slider(
+        "Dense vs Sparse α",
+        0.0, 1.0, 0.5, step=0.05,
+        help=(
+            "Choose how much to trust semantic matches vs. exact keywords:\n\n"
+            "• Move right (toward 1.0) to lean on meaning-based (dense) search.\n\n"
+            "• Move left (toward 0.0) to lean on exact-word (sparse) search."
+        )
+    )
+    dense_k = st.sidebar.slider(
+        "Dense top_k",
+        1, 10, 5,
+        help=(
+            "How many top results to pull from the semantic (dense) index.\n"
+            "Higher values may find more related info but take slightly longer."
+        )
+    )
+    sparse_k = st.sidebar.slider(
+        "Sparse top_k",
+        1, 10, 5,
+        help=(
+            "How many top results to pull from the keyword (sparse) index.\n"
+            "Higher values capture more exact matches but may slow things down."
+        )
+    )
+    final_k   = st.sidebar.slider(
+        "Results to Display",
+        1, 5, 3,
+        help="How many top results (after merging) to show in the chat."
+    )
+    threshold = st.sidebar.slider(
+        "Relevance Threshold",
+        0.0, 1.0, 0.50, step=0.01,
+        help="Minimum combined score for a result to be considered “relevant.”"
+    )
+
+    # ─── Sidebar: Conversations ─────────────────────────────────
     st.sidebar.title("Conversations")
     convo_titles = [t["title"] for t in st.session_state["conversation_threads"]]
     active_idx = st.session_state["active_conversation_index"]
@@ -143,13 +175,28 @@ def main():
 
             # Query Pinecone for top results
             start_time = time.time()
-            results = st.session_state["rag"].query(msg, top_k=3)
+            #results = st.session_state["rag"].query(msg, top_k=3)
+            # 1) Hybrid retrieval
+            raw_results = st.session_state["rag"].query(
+                query_text=msg,
+                top_k=final_k,      # pull exactly final_k if you want to rely purely on top_k
+                alpha=alpha,
+                dense_k=dense_k,
+                sparse_k=sparse_k
+            )
+            # 2) Apply threshold & limit to final_k
+            filtered_results = [
+                r for r in raw_results
+                if r["score"] >= threshold
+            ][:final_k]
+
             elapsed = time.time() - start_time
             if elapsed < 5:
                 time.sleep(5 - elapsed)
 
-            sorted_results = sorted(results, key=lambda x: x["score"], reverse=True)
-            filtered_results = [r for r in sorted_results if r.get("score", 0) >= 0.55]
+            #sorted_results = sorted(results, key=lambda x: x["score"], reverse=True)
+            #filtered_results = [r for r in sorted_results if r.get("score", 0) >= 0.55]
+            # (filtered_results now honors both your threshold slider and how many you display)
 
             context = " ".join(r["text"] for r in filtered_results) if filtered_results else ""
             answer = st.session_state["generator"].generate_answer(active_thread["history"], context, [])
@@ -175,19 +222,18 @@ def main():
                 conversation_placeholder.markdown(typed_html, unsafe_allow_html=True)
                 time.sleep(0.0025)
 
-            # Prepare citation (if available) from the top filtered result
-            citation = None
-            if filtered_results:
-                top_result = filtered_results[0]
-                citation = {
-                    "header": format_citation(top_result["source"]),
-                    "content": top_result["text"]
-                }
+            # Prepare one citation dict for EACH filtered result
+            citations = []
+            for res in filtered_results:
+                citations.append({
+                    "header": format_citation(res["source"]),
+                    "content": res["text"]
+                })
 
             # Append the assistant response (with citation if available) to the conversation history
             assistant_message = {"role": "assistant", "type": "text", "content": answer}
-            if citation:
-                assistant_message["citation"] = citation
+            if citations:
+                assistant_message["citations"] = citations
             active_thread["history"].append(assistant_message)
             conversation_placeholder.markdown(get_conversation_html(), unsafe_allow_html=True)
 
