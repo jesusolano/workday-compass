@@ -1,5 +1,9 @@
-.env
-chunks.pkl
 __pycache__/
 *.py[cod]
 .devcontainer/
+documents/
+.env
+*.log
+ingested_files.txt
+processing_files.txt
+chunks.pkl

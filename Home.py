@@ -5,6 +5,8 @@ import time
 import streamlit as st
 import logging
 import sys
+import re
+from typing import List
 from ingestion_utils import (
     RAG,
     Generator,
@@ -15,6 +17,26 @@ from ingestion_utils import (
     rename_conversation_auto,
     format_citation
 )
+
+# ─── Add follow‑up detection helper ─────────────────────────────────
+def is_follow_up(query: str) -> bool:
+    q = query.strip().lower()
+    # treat very short inputs or explicit "elaborate"/"tell me more" as follow‑ups
+    if len(q.split()) < 4:
+        return True
+    for trigger in ["elaborate", "more details", "tell me more", "explain further", "and?"]:
+        if trigger in q:
+            return True
+    return False
+
+# def annotate_superscripts(answer: str, valid_sources: List[str]) -> str:
+#     def repl(match):
+#         idx = int(match.group(1)) - 1
+#         meta = valid_sources[idx]
+#         # wrap in a tooltip
+#         return f"<sup title='{meta}'>{match.group(0)}</sup>"
+#     # find ^[n] and replace
+#     return re.sub(r"\^\[(\d+)\]", repl, answer)
 
 def main():
     st.markdown(
@@ -71,6 +93,10 @@ def main():
     if "user_text_input" not in st.session_state:
         st.session_state["user_text_input"] = ""
 
+    # ─── State for follow‑up reuse ─────────────────────────────────
+    st.session_state.setdefault("last_context", "")
+    st.session_state.setdefault("last_filtered_results", [])
+
     # Ensure an active conversation exists
     if (st.session_state.get("active_conversation_index") is None or
        st.session_state["active_conversation_index"] >= len(st.session_state["conversation_threads"])):
@@ -86,41 +112,41 @@ def main():
     # Sidebar for conversation selection
     # ─── Retrieval Controls ──────────────────────────────────────
     st.sidebar.markdown("## Retrieval Settings")
+
     alpha = st.sidebar.slider(
         "Dense vs Sparse α",
-        0.0, 1.0, 0.5, step=0.05,
+        0.0, 1.0, 0.5, step=0.01,
         help=(
             "Choose how much to trust semantic matches vs. exact keywords:\n\n"
-            "• Move right (toward 1.0) to lean on meaning-based (dense) search.\n\n"
-            "• Move left (toward 0.0) to lean on exact-word (sparse) search."
+            "• Move right (toward 1.0) to lean on meaning-based (dense) search.\n\n"
+            "• Move left (toward 0.0) to lean on exact-word (sparse) search."
         )
     )
-    dense_k = st.sidebar.slider(
-        "Dense top_k",
-        1, 10, 5,
-        help=(
-            "How many top results to pull from the semantic (dense) index.\n"
-            "Higher values may find more related info but take slightly longer."
-        )
-    )
-    sparse_k = st.sidebar.slider(
-        "Sparse top_k",
-        1, 10, 5,
-        help=(
-            "How many top results to pull from the keyword (sparse) index.\n"
-            "Higher values capture more exact matches but may slow things down."
-        )
-    )
-    final_k   = st.sidebar.slider(
+
+    # automatically compute the two top_k values so they sum to 10
+    total_k = 10
+    dense_k  = int(round(alpha * total_k))
+    sparse_k = total_k - dense_k
+
+    # Number of merged results to show
+    final_k = st.sidebar.slider(
         "Results to Display",
-        1, 5, 3,
+        1, 10, 5,
         help="How many top results (after merging) to show in the chat."
     )
+
+    # Relevance threshold
     threshold = st.sidebar.slider(
         "Relevance Threshold",
         0.0, 1.0, 0.50, step=0.01,
         help="Minimum combined score for a result to be considered “relevant.”"
     )
+
+    # Warn on very low thresholds
+    if threshold <= 0.25:
+        st.sidebar.warning(
+            "Heads-up: With such a low relevance threshold, you may see sources that aren’t strongly related to your query."
+        )
 
     # ─── Sidebar: Conversations ─────────────────────────────────
     st.sidebar.title("Conversations")
@@ -173,34 +199,41 @@ def main():
             temp_msg = "<p style='font-style: italic; color: #555555; margin: 0;'>Searching the knowledge base...</p>"
             conversation_placeholder.markdown(get_conversation_html() + temp_msg, unsafe_allow_html=True)
 
-            # Query Pinecone for top results
-            start_time = time.time()
-            #results = st.session_state["rag"].query(msg, top_k=3)
-            # 1) Hybrid retrieval
-            raw_results = st.session_state["rag"].query(
-                query_text=msg,
-                top_k=final_k,      # pull exactly final_k if you want to rely purely on top_k
-                alpha=alpha,
-                dense_k=dense_k,
-                sparse_k=sparse_k
-            )
-            # 2) Apply threshold & limit to final_k
-            filtered_results = [
-                r for r in raw_results
-                if r["score"] >= threshold
-            ][:final_k]
+            # ─── Determine if this is a follow‑up ───────────────────
+            if is_follow_up(msg) and st.session_state["last_context"]:
+                # reuse previous context & results
+                context = st.session_state["last_context"]
+                filtered_results = st.session_state["last_filtered_results"]
+            else:
+                # ─── new query: do hybrid retrieval ────────────────
+                start_time = time.time()
+                raw_results = st.session_state["rag"].query(
+                    query_text=msg,
+                    top_k=final_k,
+                    alpha=alpha,
+                    dense_k=dense_k,
+                    sparse_k=sparse_k
+                )
+                filtered_results = [
+                    r for r in raw_results
+                    if r["score"] >= threshold
+                ][:final_k]
+                # store for potential follow‑up
+                st.session_state["last_context"] = " ".join(r["text"] for r in filtered_results)
+                st.session_state["last_filtered_results"] = filtered_results
 
-            elapsed = time.time() - start_time
+            # Build a numbered list of source metadata
+            valid_sources = [
+                format_citation(r["source"])
+                for r in filtered_results
+            ]
+
+            # ensure a small delay for UX consistency
+            elapsed = time.time() - start_time if 'start_time' in locals() else 0
             if elapsed < 5:
                 time.sleep(5 - elapsed)
 
-            #sorted_results = sorted(results, key=lambda x: x["score"], reverse=True)
-            #filtered_results = [r for r in sorted_results if r.get("score", 0) >= 0.55]
-            # (filtered_results now honors both your threshold slider and how many you display)
-
-            context = " ".join(r["text"] for r in filtered_results) if filtered_results else ""
-            answer = st.session_state["generator"].generate_answer(active_thread["history"], context, [])
-
+            # ─── decide if we need a “no‐KB‐hits” intro ───────────────────
             if not filtered_results:
                 answer_intro = (
                     "We could not find relevant information from our internal knowledge base regarding your query. "
@@ -208,19 +241,35 @@ def main():
                 )
             else:
                 answer_intro = ""
-            answer = answer_intro + answer
 
-            # "Type" out the answer gradually
-            partial_text = ""
-            for char in answer:
-                partial_text += char
-                typed_html = (
-                    get_conversation_html() +
-                    f'<div class="chat-bubble assistant-bubble"><strong>Assistant:</strong> {partial_text}</div>'
-                    f'<div class="clearfix"></div>'
+            # 1) Get the raw answer first
+            raw_answer = st.session_state["generator"].generate_answer(
+                history=active_thread["history"],
+                context=st.session_state["last_context"],
+                valid_sources=valid_sources
+            )
+
+            # 2) Stream out the raw answer
+            partial = ""
+            for char in raw_answer:
+                partial += char
+                conversation_placeholder.markdown(
+                    get_conversation_html()
+                    + f'<div class="chat-bubble assistant-bubble">'
+                    f'<strong>Assistant:</strong> {partial}</div>'
+                    + '<div class="clearfix"></div>',
+                    unsafe_allow_html=True
                 )
-                conversation_placeholder.markdown(typed_html, unsafe_allow_html=True)
                 time.sleep(0.0025)
+
+            # 3) Render the final answer (no inline highlighting)
+            full_answer = answer_intro + raw_answer
+            conversation_placeholder.markdown(
+                get_conversation_html()
+                + f'<div class="chat-bubble assistant-bubble"><strong>Assistant:</strong> {full_answer}</div>'
+                + '<div class="clearfix"></div>',
+                unsafe_allow_html=True
+            )
 
             # Prepare one citation dict for EACH filtered result
             citations = []
@@ -231,7 +280,7 @@ def main():
                 })
 
             # Append the assistant response (with citation if available) to the conversation history
-            assistant_message = {"role": "assistant", "type": "text", "content": answer}
+            assistant_message = {"role": "assistant", "type": "text", "content": full_answer}
             if citations:
                 assistant_message["citations"] = citations
             active_thread["history"].append(assistant_message)

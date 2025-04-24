@@ -23,7 +23,16 @@ import numpy as np
 import pdfplumber
 from PyPDF2 import PdfReader
 
-from rank_bm25 import BM25Okapi
+# ===== Monkey-patch for cached_download compatibility =====
+import huggingface_hub
+if not hasattr(huggingface_hub, "cached_download"):
+    # alias the old name to the new function
+    huggingface_hub.cached_download = huggingface_hub.hf_hub_download
+# =========================================================
+
+# now it’s safe to import downstream libraries that expect cached_download()
+from sentence_transformers import SentenceTransformer
+
 try:
     from rank_bm25 import BM25Okapi
 except ImportError:
@@ -335,15 +344,22 @@ class RAG:
 
     def load_index(self):
         if os.path.exists(self.chunks_path):
-            with open(self.chunks_path, "rb") as f:
-                self.chunks = pickle.load(f)
-            if self.chunks and isinstance(self.chunks[0], str):
-                self.chunks = [{"text": c, "source": "unknown"} for c in self.chunks]
+            try:
+                with open(self.chunks_path, "rb") as f:
+                    self.chunks = pickle.load(f)
+            except (EOFError, pickle.UnpicklingError) as e:
+                logger.warning(f"Could not load chunks from {self.chunks_path} ({e}); starting fresh.")
+                self.chunks = []
+            else:
+                # old‐format support: convert list[str] → list[dict]
+                if self.chunks and isinstance(self.chunks[0], str):
+                    self.chunks = [{"text": c, "source": "unknown"} for c in self.chunks]
         else:
             self.chunks = []
-            # build sparse index only if BM25Okapi is available
-            if BM25Okapi:
-                self._build_sparse_index()
+
+        # (re)build sparse index if we have any chunks
+        if BM25Okapi and self.chunks:
+            self._build_sparse_index()
 
     def _build_sparse_index(self):
         # no chunks → skip
@@ -371,6 +387,20 @@ class Generator:
             "and conversation history. Your response should be detailed and include citations where applicable."
         )
         messages.append({"role": "system", "content": system_prompt})
+
+        # If we have sources, enumerate them for the model
+        if valid_sources:
+            # Build a numbered list
+            src_list = "\n".join(f"[{i+1}] {s}" for i, s in enumerate(valid_sources))
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Here are the available sources to cite:\n" + src_list +
+                    "\n\nAfter each sentence in your answer, append a superscript citation like ^[1] "
+                    "to indicate which source you used."
+                )
+            })
+
         if context:
             messages.append({"role": "system", "content": f"Context: {context}"})
         for msg in history:
@@ -398,6 +428,7 @@ def ingest_documents():
 
     logger.info("Starting document ingestion process...")
     with st.spinner("Ingesting new documents..."):
+        rag = st.session_state["rag"]
         for filename in os.listdir(docs_dir):
             filepath = os.path.join(docs_dir, filename)
             if not os.path.isfile(filepath):
@@ -436,42 +467,63 @@ def ingest_documents():
                         pdf_reader = PdfReader(f)
                         sections = get_outline_sections(pdf_reader)
 
+                    # === Text-only PDF ingestion ===
                     with pdfplumber.open(filepath) as pdf:
                         if sections:
-                            logger.info(f"PDF file {filename} has outline sections. Total sections: {len(sections)}")
+                            logger.info(f"PDF {filename} has {len(sections)} outline sections")
                             for title, start_page, end_page in sections:
+                                # 1) Log what pages this section covers
+                                logger.debug(
+                                    f"Section '{title}' spans pages [{start_page}..{end_page - 1}]"
+                                )
+                                # 2) Pull raw text from that page range
                                 page_texts = []
-                                for i in range(start_page, end_page):
-                                    if i < len(pdf.pages):
-                                        page = pdf.pages[i]
-                                        page_text = page.extract_text() or ""
-                                        if not page_text.strip():
-                                            continue
-                                        page_texts.append(page_text)
+                                for p in range(start_page, end_page):
+                                    if p < len(pdf.pages):
+                                        txt = pdf.pages[p].extract_text() or ""
+                                        if txt.strip():
+                                            page_texts.append(txt)
+                                # 3) If truly empty, warn once
                                 if not page_texts:
-                                    logger.warning(f"Section '{title}' in {filename} is empty, skipping.")
+                                    logger.warning(
+                                        f"Section '{title}' (pages {start_page}–{end_page-1}) has no text; skipping."
+                                    )
                                     continue
-                                page_texts = remove_headers_and_footers(page_texts)
-                                section_text = "\n\n".join(page_texts)
-                                chunks = dynamic_chunk_text(section_text, max_words=700)
-                                for i, chunk in enumerate(chunks):
-                                    meta_str = f"{filename} | Section: {title} | Chunk: {i+1}/{len(chunks)}"
-                                    logger.debug(f"Ingesting chunk {i+1} of {len(chunks)} from section '{title}' in PDF file: {filename}.")
-                                    st.session_state["rag"].ingest_document(chunk, source=meta_str, pre_split=True)
-                                    time.sleep(0.3)
+
+                                # 4) Ingest the entire section as one chunk
+                                section_text = "\n\n".join(
+                                    remove_headers_and_footers(page_texts)
+                                )
+                                meta_str = f"{filename} | Section: {title}"
+                                logger.debug(
+                                    f"Ingesting section '{title}' as a single chunk"
+                                )
+                                st.session_state["rag"].ingest_document(
+                                    section_text,
+                                    source=meta_str,
+                                    pre_split=True
+                                )
+                                time.sleep(0.3)
+
                         else:
-                            logger.info(f"PDF file {filename} does not have outline sections, ingesting by pages.")
-                            for page_idx, page in enumerate(pdf.pages):
-                                page_text = page.extract_text() or ""
-                                if not page_text.strip():
+                            logger.info(f"No outline for {filename}; ingesting by page")
+                            for page_idx, page in enumerate(pdf.pages, start=1):
+                                txt = page.extract_text() or ""
+                                if not txt.strip():
                                     continue
-                                page_text = remove_headers_and_footers([page_text])[0]
-                                page_chunks = dynamic_chunk_text(page_text, max_words=700)
-                                for i, chunk in enumerate(page_chunks):
-                                    meta_str = f"{filename} | Page: {page_idx + 1} | Chunk: {i+1}/{len(page_chunks)}"
-                                    logger.debug(f"Ingesting chunk {i+1} of {len(page_chunks)} from page {page_idx+1} in PDF file: {filename}.")
-                                    st.session_state["rag"].ingest_document(chunk, source=meta_str, pre_split=True)
-                                    time.sleep(0.3)
+                                clean = remove_headers_and_footers([txt])[0]
+                                # ingest each page as one chunk
+                                meta_str = f"{filename} | Page: {page_idx}"
+                                logger.debug(
+                                    f"Ingesting page {page_idx} of {filename} as single chunk"
+                                )
+                                st.session_state["rag"].ingest_document(
+                                    clean,
+                                    source=meta_str,
+                                    pre_split=True
+                                )
+                                time.sleep(0.3)
+
                     progress_placeholder.text(f"Ingested {filename}")
                     logger.info(f"Successfully ingested PDF file: {filename}.")
                     time.sleep(0.5)
