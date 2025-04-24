@@ -277,24 +277,28 @@ class RAG:
         self._build_sparse_index()
 
     def query(self, query_text, top_k=3, alpha=0.5, dense_k=10, sparse_k=10):
-        # — dense retrieval via Pinecone —
+        # — dense retrieval via Pinecone (only if dense_k > 0) —
         q_emb = self.model.encode([query_text])[0].astype('float32')
-        dense_resp = self.index.query(vector=q_emb.tolist(),
-                                      top_k=dense_k,
-                                      include_metadata=True)
-        dense_matches = [{
-            "id": m["id"],
-            "score": m["score"],
-            "text": m["metadata"]["text"],
-            "source": m["metadata"]["source"]
-        } for m in dense_resp["matches"]]
+        dense_matches = []
+        if dense_k > 0:
+            dense_resp = self.index.query(
+                vector=q_emb.tolist(),
+                top_k=dense_k,
+                include_metadata=True
+            )
+            dense_matches = [{
+                "id": m["id"],
+                "score": m["score"],
+                "text": m["metadata"]["text"],
+                "source": m["metadata"]["source"]
+            } for m in dense_resp["matches"]]
 
-        # — sparse retrieval via BM25, if built —
+        # — sparse retrieval via BM25 (only if sparse_k > 0) —
         sparse_matches = []
-        if BM25Okapi and getattr(self, "bm25", None):
+        if sparse_k > 0 and BM25Okapi and getattr(self, "bm25", None):
             tokens = query_text.split()
-            sparse_scores = self.bm25.get_scores(tokens)
-            top_sparse = sorted(enumerate(sparse_scores),
+            scores = self.bm25.get_scores(tokens)
+            top_sparse = sorted(enumerate(scores),
                                 key=lambda x: x[1],
                                 reverse=True)[:sparse_k]
             sparse_matches = [{
