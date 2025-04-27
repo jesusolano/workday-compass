@@ -1,8 +1,8 @@
 streamlit
-huggingface-hub==0.25.2
-sentence-transformers==2.2.2
+huggingface-hub==0.30.1
+sentence-transformers>=2.2.2
+transformers>=4.35.0
 numpy
-transformers
 torch>=2.4.0,<3.0
 PyPDF2
 openai==0.28

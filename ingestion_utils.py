@@ -23,15 +23,36 @@ import numpy as np
 import pdfplumber
 from PyPDF2 import PdfReader
 
-# ===== Monkey-patch for cached_download compatibility =====
-import huggingface_hub
-if not hasattr(huggingface_hub, "cached_download"):
-    # alias the old name to the new function
-    huggingface_hub.cached_download = huggingface_hub.hf_hub_download
-# =========================================================
+from pdfminer.high_level import extract_text_to_fp
+from pdfminer.layout import LAParams
+from io import BytesIO
 
-# now it’s safe to import downstream libraries that expect cached_download()
+import huggingface_hub
+
+# # === Restore missing OfflineModeIsEnabled on hf_hub.utils ===
+# try:
+#     # import the new location...
+#     from huggingface_hub.errors import OfflineModeIsEnabled
+#     # ...and bind it back onto the old utils module
+#     import huggingface_hub.utils as _hf_utils
+#     _hf_utils.OfflineModeIsEnabled = OfflineModeIsEnabled
+# except ImportError:
+#     pass
+#
+# #### Monkey-patch HF downloads to drop unsupported kwargs ####
+# if hasattr(huggingface_hub, "hf_hub_download"):
+#     _orig_hf_hub_download = huggingface_hub.hf_hub_download
+#     def _patched_hf_hub_download(*args, **kwargs):
+#         # remove any kwargs the installed version doesn’t accept
+#         kwargs.pop("url", None)
+#         kwargs.pop("legacy_cache_layout", None)
+#         return _orig_hf_hub_download(*args, **kwargs)
+#     # override both entry-points
+#     huggingface_hub.hf_hub_download = _patched_hf_hub_download
+#     huggingface_hub.cached_download  = _patched_hf_hub_download
+
 from sentence_transformers import SentenceTransformer
+from transformers import LayoutLMTokenizerFast, LayoutLMModel
 
 try:
     from rank_bm25 import BM25Okapi
@@ -207,6 +228,45 @@ def remove_headers_and_footers(page_texts):
     texts_no_header_footer = remove_common_footer(texts_no_header, min_percentage=0.5, max_length=None)
     return texts_no_header_footer
 
+def extract_words_and_boxes_from_pages(pdf, start_page, end_page):
+    """
+    Flattens all words and their bboxes from pdf.pages[start_page:end_page].
+    Returns:
+      words: List[str], boxes: List[List[int]] = [x0, y0, x1, y1]
+    """
+    words, boxes = [], []
+    for p in range(start_page, end_page):
+        page = pdf.pages[p]
+        for w in page.extract_words():
+            words.append(w["text"])
+            # pdfplumber uses keys x0, top, x1, bottom
+            boxes.append([
+                int(w["x0"]), int(w["top"]),
+                int(w["x1"]), int(w["bottom"])
+            ])
+    return words, boxes
+
+def pdf_section_to_html(filepath, start_page, end_page) -> str:
+    """
+    Extract the given page range as HTML bytes, then decode to str.
+    """
+    output = BytesIO()
+    laparams = LAParams()
+    with open(filepath, "rb") as fp:
+        extract_text_to_fp(
+            fp,
+            output,
+            laparams=laparams,
+            output_type="html",
+            page_numbers=list(range(start_page, end_page))
+        )
+    html_bytes = output.getvalue()
+    try:
+        return html_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        # fallback if encoding differs
+        return html_bytes.decode("latin-1")
+
 def format_citation(source):
     parts = [part.strip() for part in source.split("|")]
     parts = [part for part in parts if not re.match(r'^chunk:', part, re.IGNORECASE)]
@@ -233,10 +293,21 @@ from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone
 
 class RAG:
-    def __init__(self, pinecone_index_name, model_name='all-MiniLM-L6-v2',
-                 chunk_size=500, chunk_overlap=50, chunks_path="chunks.pkl"):
-        # Let the model auto-select the device after hiding GPUs.
-        self.model = SentenceTransformer(model_name)
+    # def __init__(self, pinecone_index_name, model_name='all-MiniLM-L6-v2',
+    #              chunk_size=500, chunk_overlap=50, chunks_path="chunks.pkl"):
+    def __init__(self,
+                 pinecone_index_name,
+                 model_name='microsoft/layoutlm-base-uncased',
+                  chunk_size=500,
+                  chunk_overlap=50,
+                  chunks_path="chunks.pkl"):
+        # Initialize LayoutLM tokenizer + model on CPU
+        self.tokenizer         = LayoutLMTokenizerFast.from_pretrained(model_name)
+        #self.feature_extractor = LayoutLMFeatureExtractor(apply_ocr=False)
+        self.model             = LayoutLMModel.from_pretrained(model_name).to('cpu')
+        # for plain-text embeddings
+        #self.text_encoder = SentenceTransformer('all-MiniLM-L6-v2')
+        self.text_encoder  = SentenceTransformer('all-mpnet-base-v2')
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.chunks_path = chunks_path
@@ -258,55 +329,156 @@ class RAG:
             start = end - self.chunk_overlap
         return chunks
 
-    def ingest_document(self, text, source="unknown", pre_split=False):
-        if pre_split:
-            new_chunks = [text]
-        else:
-            new_chunks = self._split_text(text)
-        start_index = len(self.chunks)
-        for chunk in new_chunks:
-            self.chunks.append({"text": chunk, "source": source})
-        embeddings = self.model.encode(new_chunks, show_progress_bar=True)
-        embeddings = np.array(embeddings).astype('float32')
-        vectors = []
-        for i, emb in enumerate(embeddings):
-            vector_id = str(start_index + i)
-            metadata = {"text": new_chunks[i], "source": source}
-            vectors.append((vector_id, emb.tolist(), metadata))
-        self.index.upsert(vectors=vectors)
+    def ingest_document_with_layout(
+        self,
+        words: list[str],
+        boxes: list[list[int]],
+        source: str = "unknown",
+        text: str | None = None,
+        html: str | None = None
+    ) -> None:
+        """
+        Ingest a single layout-aware document chunk:
+          - words: list of word tokens
+          - boxes: parallel list of [x0, y0, x1, y1] for each word
+          - source: identifier for document/section
+          - text: optional plain-text with \n\n preserved
+          - html: optional HTML/Markdown rendition
+        """
+        # 1) Tokenize into LayoutLM inputs
+        tok_out = self.tokenizer(
+            words,
+            return_tensors="pt",
+            is_split_into_words=True,
+            padding=True,
+            truncation=True
+        )
+
+        # 2) Align each token back to its original bbox
+        word_id_list = tok_out.word_ids(batch_index=0)
+        aligned_boxes: list[list[int]] = []
+        for word_id in word_id_list:
+            if word_id is None:
+                aligned_boxes.append([0, 0, 0, 0])
+            else:
+                aligned_boxes.append(boxes[word_id])
+
+        # 3) Build the tensor for LayoutLM’s bbox input
+        bbox_tensor = torch.tensor([aligned_boxes], dtype=torch.long)
+
+        # 4) Forward through LayoutLM
+        outputs = self.model(
+            input_ids      = tok_out.input_ids,
+            attention_mask = tok_out.attention_mask,
+            bbox           = bbox_tensor
+        )
+        emb = outputs.pooler_output[0].detach().cpu().numpy().astype('float32')
+
+        # 5) Prepare your chunk’s text/html and metadata
+        idx        = len(self.chunks)
+        chunk_text = text if text is not None else " ".join(words)
+        chunk_html = html  # may be None
+        self.chunks.append({
+            "text":   chunk_text,
+            "html":   chunk_html,
+            "source": source
+        })
+
+        metadata = {"source": source}
+
+        # 6) Upsert into Pinecone with both text & html in metadata
+        self.index.upsert(vectors=[(str(idx), emb.tolist(), metadata)])
+
+        # 7) Rebuild your BM25 index on the plain-text corpus
         self._build_sparse_index()
 
-    def query(self, query_text, top_k=3, alpha=0.5, dense_k=10, sparse_k=10):
-        # — dense retrieval via Pinecone (only if dense_k > 0) —
-        q_emb = self.model.encode([query_text])[0].astype('float32')
-        dense_matches = []
+    def query(self,
+              query_text: str,
+              top_k: int = 3,
+              alpha: float = 0.5,
+              dense_k: int = 10,
+              sparse_k: int = 10) -> list[dict]:
+        """
+        Perform a hybrid dense + sparse retrieval, then merge results.
+        Each result dict contains: id, text, html, source, score.
+        """
+        # 1) Embed the query with your text_encoder
+        q_emb = self.text_encoder.encode([query_text])[0].astype('float32')
+
+        # 2) Dense (semantic) retrieval via Pinecone
+        dense_matches: list[dict] = []
         if dense_k > 0:
             dense_resp = self.index.query(
                 vector=q_emb.tolist(),
                 top_k=dense_k,
                 include_metadata=True
             )
-            dense_matches = [{
-                "id": m["id"],
-                "score": m["score"],
-                "text": m["metadata"]["text"],
-                "source": m["metadata"]["source"]
-            } for m in dense_resp["matches"]]
+            for m in dense_resp["matches"]:
+                idx = int(m["id"])
+                dense_matches.append({
+                    "id":     m["id"],
+                    "score":  m["score"],
+                    "text":   self.chunks[idx]["text"],
+                    "html":   self.chunks[idx].get("html"),
+                    "source": self.chunks[idx]["source"]
+                })
 
-        # — sparse retrieval via BM25 (only if sparse_k > 0) —
-        sparse_matches = []
+        # 3) Sparse (keyword) retrieval via BM25
+        sparse_matches: list[dict] = []
         if sparse_k > 0 and BM25Okapi and getattr(self, "bm25", None):
             tokens = query_text.split()
             scores = self.bm25.get_scores(tokens)
-            top_sparse = sorted(enumerate(scores),
-                                key=lambda x: x[1],
-                                reverse=True)[:sparse_k]
-            sparse_matches = [{
-                "id": str(idx),
-                "score": score,
-                "text": self.chunks[idx]["text"],
-                "source": self.chunks[idx]["source"]
-            } for idx, score in top_sparse]
+            top_sparse = sorted(
+                enumerate(scores),
+                key=lambda x: x[1],
+                reverse=True
+            )[:sparse_k]
+
+            for idx, score in top_sparse:
+                sparse_matches.append({
+                    "id":     str(idx),
+                    "score":  score,
+                    "text":   self.chunks[idx]["text"],
+                    "html":   self.chunks[idx].get("html"),
+                    "source": self.chunks[idx]["source"]
+                })
+
+        # 4) Normalize scores to [0,1]
+        def normalize(matches: list[dict]) -> dict[str, float]:
+            if not matches:
+                return {}
+            vals = [m["score"] for m in matches]
+            lo, hi = min(vals), max(vals)
+            if hi - lo < 1e-6:
+                return {m["id"]: 1.0 for m in matches}
+            return {m["id"]: (m["score"] - lo) / (hi - lo) for m in matches}
+
+        d_norm = normalize(dense_matches)
+        s_norm = normalize(sparse_matches)
+
+        # 5) Merge by weighted sum
+        merged: dict[str, dict] = {}
+        for m in dense_matches + sparse_matches:
+            d_sc = d_norm.get(m["id"], 0.0)
+            s_sc = s_norm.get(m["id"], 0.0)
+            combined = alpha * d_sc + (1 - alpha) * s_sc
+            if (m["id"] not in merged) or (merged[m["id"]]["score"] < combined):
+                merged[m["id"]] = {
+                    "id":     m["id"],
+                    "text":   m["text"],
+                    "html":   m.get("html"),
+                    "source": m["source"],
+                    "score":  combined
+                }
+
+        # 6) Return the top_k results
+        results = sorted(
+            merged.values(),
+            key=lambda x: x["score"],
+            reverse=True
+        )[:top_k]
+
+        return results
 
         # — normalize scores to [0,1] —
         def normalize(xs):
@@ -347,21 +519,20 @@ class RAG:
             pickle.dump(self.chunks, f)
 
     def load_index(self):
+        """
+        Load any previously‐saved chunks from disk, then rebuild the sparse (BM25) index.
+        """
         if os.path.exists(self.chunks_path):
             try:
                 with open(self.chunks_path, "rb") as f:
                     self.chunks = pickle.load(f)
             except (EOFError, pickle.UnpicklingError) as e:
-                logger.warning(f"Could not load chunks from {self.chunks_path} ({e}); starting fresh.")
+                # failed to unpickle? start fresh
                 self.chunks = []
-            else:
-                # old‐format support: convert list[str] → list[dict]
-                if self.chunks and isinstance(self.chunks[0], str):
-                    self.chunks = [{"text": c, "source": "unknown"} for c in self.chunks]
         else:
             self.chunks = []
 
-        # (re)build sparse index if we have any chunks
+        # If BM25 is available and we have chunks, rebuild sparse index
         if BM25Okapi and self.chunks:
             self._build_sparse_index()
 
@@ -494,37 +665,52 @@ def ingest_documents():
                                     )
                                     continue
 
-                                # 4) Ingest the entire section as one chunk
-                                section_text = "\n\n".join(
-                                    remove_headers_and_footers(page_texts)
+                                # 4) Extract layout info and also preserve the raw paragraphs
+                                cleaned_texts = remove_headers_and_footers(page_texts)
+                                raw_text = "\n\n".join(cleaned_texts)
+                                words, boxes = extract_words_and_boxes_from_pages(
+                                    pdf, start_page, end_page
                                 )
+                                if not words:
+                                    logger.warning(
+                                        f"Section '{title}' empty after layout extraction; skipping."
+                                    )
+                                    continue
                                 meta_str = f"{filename} | Section: {title}"
-                                logger.debug(
-                                    f"Ingesting section '{title}' as a single chunk"
-                                )
-                                st.session_state["rag"].ingest_document(
-                                    section_text,
+                                html = pdf_section_to_html(filepath, start_page, end_page)
+                                st.session_state["rag"].ingest_document_with_layout(
+                                    words,
+                                    boxes,
                                     source=meta_str,
-                                    pre_split=True
+                                    text=raw_text,
+                                    html=html
                                 )
                                 time.sleep(0.3)
 
                         else:
                             logger.info(f"No outline for {filename}; ingesting by page")
                             for page_idx, page in enumerate(pdf.pages, start=1):
-                                txt = page.extract_text() or ""
-                                if not txt.strip():
+                                # 1) Pull raw text for this single page
+                                page_text = page.extract_text() or ""
+                                if not page_text.strip():
                                     continue
-                                clean = remove_headers_and_footers([txt])[0]
-                                # ingest each page as one chunk
-                                meta_str = f"{filename} | Page: {page_idx}"
-                                logger.debug(
-                                    f"Ingesting page {page_idx} of {filename} as single chunk"
+                                # 2) Preserve it as raw_text and get layout tokens
+                                raw_text = page_text
+                                words, boxes = extract_words_and_boxes_from_pages(
+                                    pdf, page_idx-1, page_idx
                                 )
-                                st.session_state["rag"].ingest_document(
-                                    clean,
+                                if not words:
+                                    continue
+                                meta_str = f"{filename} | Page: {page_idx}"
+                                # 3) Convert this page to HTML
+                                html = pdf_section_to_html(filepath, page_idx-1, page_idx)
+                                # 4) Ingest with both text and html
+                                st.session_state["rag"].ingest_document_with_layout(
+                                    words,
+                                    boxes,
                                     source=meta_str,
-                                    pre_split=True
+                                    text=raw_text,
+                                    html=html
                                 )
                                 time.sleep(0.3)
 
@@ -572,12 +758,20 @@ def get_conversation_html():
             # Render one collapsible section per citation
             if "citations" in msg and msg["citations"]:
                 for citation in msg["citations"]:
-                    formatted_content = smart_format_text(citation["content"])
+                    # if you ingested real HTML, use it; otherwise fall back to plain text
+                    content = citation.get("html") or citation["content"]
                     html += (
-                        f'<div class="chat-bubble citation-bubble" style="border-radius: 15px; padding: 10px; background-color: #f8f8f8;">'
-                        f'<details><summary style="font-size: 14px; color: #666;">Citation: {format_citation(citation["header"])}</summary>'
-                        f'<div style="font-size: 13px; padding: 8px;">{formatted_content}</div>'
-                        f'</details></div>'
+                        f'<div class="chat-bubble citation-bubble" '
+                          'style="border-radius: 15px; padding: 10px; background-color: #f8f8f8;">'
+                        f'<details>'
+                          f'<summary style="font-size: 14px; color: #666;">'
+                            f'Citation: {format_citation(citation["header"])}'
+                          f'</summary>'
+                          f'<div style="white-space: pre-wrap; font-size: 13px; padding: 8px;">'
+                            f'{content}'
+                          f'</div>'
+                        f'</details>'
+                        f'</div>'
                     )
         html += '<div class="clearfix"></div>'
     html += "</div>"
